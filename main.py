@@ -39,9 +39,7 @@ QUADKEYS = [
 
 SCHEMA = [
     bigquery.SchemaField("id", "STRING"),
-    bigquery.SchemaField("raw", "STRING"),
-    bigquery.SchemaField("directory_timestamp", "TIMESTAMP"),
-    bigquery.SchemaField("scrape_timestamp", "TIMESTAMP"),
+    bigquery.SchemaField("title", "STRING"),
     bigquery.SchemaField("file_title", "STRING"),
     bigquery.SchemaField(
         "desc",
@@ -63,7 +61,6 @@ SCHEMA = [
             bigquery.SchemaField("n_out", "INTEGER"),
         ),
     ),
-    bigquery.SchemaField("title", "STRING"),
     bigquery.SchemaField(
         "geom",
         "RECORD",
@@ -72,6 +69,11 @@ SCHEMA = [
             bigquery.SchemaField("p", "STRING", "REPEATED"),
         ),
     ),
+    bigquery.SchemaField("directory_timestamp", "TIMESTAMP"),
+    bigquery.SchemaField("scrape_timestamp", "TIMESTAMP"),
+    bigquery.SchemaField("point_shape", "STRING"),
+    bigquery.SchemaField("area_shape", "STRING"),
+    bigquery.SchemaField("raw", "STRING"),
 ]
 
 logging.basicConfig(level=logging.INFO)
@@ -110,8 +112,8 @@ def get_outages(
             "quadkey": quadkey,
             "scrape_timestamp": marshal_timestamp(scrape_timestamp),
             "directory_timestamp": marshal_timestamp(directory_timestamp),
-            "point_shape": polylines_to_linestring(row.get("geom", {}).get("p", [])),
-            "area_shape": polylines_to_linestring(row.get("geom", {}).get("a", [])),
+            "point_shape": polylines_to_shape(row.get("geom", {}).get("p", [])),
+            "area_shape": polylines_to_shape(row.get("geom", {}).get("a", [])),
             # Save the raw data in case we need to parse it again later.
             "raw": json.dumps(row),
         }
@@ -128,11 +130,13 @@ def get_outages(
 
 def marshal_timestamp(timestamp: datetime) -> str:
     # We expect timestamps to be in utc already
-    assert timestamp.tzinfo == timezone.utc, f"got unexpected timezone {timestamp.tzinfo}"
+    assert (
+        timestamp.tzinfo == timezone.utc
+    ), f"got unexpected timezone {timestamp.tzinfo}"
     return timestamp.replace(tzinfo=None).isoformat()
 
 
-def polylines_to_linestring(polylines: List[str]) -> Optional[str]:
+def polylines_to_shape(polylines: List[str]) -> Optional[str]:
     """Convert a list of encoded polylines to a stringified shape.
 
     Note: Dominion seems to use a single point for geom["p"] and a single line for geom["a"], but
@@ -149,8 +153,8 @@ def polylines_to_linestring(polylines: List[str]) -> Optional[str]:
     else:
         if all(shape.type == "Point" for shape in shapes):
             return str(sg.MultiPoint(shapes))
-        elif all(shape.type == "LineString" for shape in shapes):
-            return str(sg.MultiLineString(shapes))
+        elif all(shape.type == "Polygon" for shape in shapes):
+            return str(sg.MultiPolygon(shapes))
         else:
             shape_types = [shape.type for shape in shapes]
             logger.warning(f"got mismatched types: {', '.join(shape_types)}")
@@ -169,7 +173,7 @@ def polyline_to_shape(polyline: str) -> Optional[sg.base.BaseGeometry]:
     if len(decoded) == 1:
         return sg.Point(decoded[0]["lng"], decoded[0]["lat"])
     else:
-        return sg.LineString([[coord["lng"], coord["lat"]] for coord in decoded])
+        return sg.LineString([[coord["lng"], coord["lat"]] for coord in decoded]).convex_hull
 
 
 def main():
@@ -184,7 +188,9 @@ def main():
     )
 
     directory = get_directory(session)
-    directory_timestamp = datetime.strptime(directory, "%Y_%m_%d_%H_%M_%S").replace(tzinfo=timezone.utc)
+    directory_timestamp = datetime.strptime(directory, "%Y_%m_%d_%H_%M_%S").replace(
+        tzinfo=timezone.utc
+    )
 
     outages = []
     for quadkey in QUADKEYS:
@@ -197,6 +203,8 @@ def main():
                 scrape_timestamp=scrape_timestamp,
             )
         )
+
+    logger.info(f"collected {len(outages)} outages")
 
     bq_client.load_table_from_json(
         outages,
@@ -211,6 +219,13 @@ def main():
             schema=table.schema,
         ),
     ).result()
+
+    logger.info("wrote outages to bigquery")
+
+
+def entrypoint(event, context):
+    """Google cloud functions entrypoint."""
+    main()
 
 
 if __name__ == "__main__":
