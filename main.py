@@ -1,13 +1,15 @@
 #!/usr/bin/env python
 
+import asyncio
 import json
 import logging
 import math
+import pathlib
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
-from datetime import datetime, timezone
 
 import googlemaps
-import requests
+import httpx
 import shapely.geometry as sg
 from google.cloud import bigquery
 
@@ -21,16 +23,18 @@ TABLE_ID = "outages"
 
 # Max quadkey length based on inspecting requests from the outage map.
 MAX_QUADKEY_LENGTH = 14
-# Quadkeys at minimum resolution based on inspecting requests from the outage ma.
+# Quadkeys at minimum resolution based on inspecting requests from the outage map.
+# TODO: Determine which quadkeys are part of the Dominion service area to save time on unnecessary
+# requests.
 QUADKEYS = [
+    "03200",
+    "03201",
     "02133",
     "02311",
     "02313",
     "03022",
     "03023",
     "03032",
-    "03200",
-    "03201",
     "03202",
     "03203",
     "03210",
@@ -80,27 +84,57 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-def get_directory(session: requests.Session) -> str:
-    response = requests.get(f"{BASE_URL}{METADATA_URL}")
+async def get_current_directory(client: httpx.AsyncClient) -> str:
+    response = await client.get(f"{BASE_URL}{METADATA_URL}")
     response.raise_for_status()
     return response.json()["directory"]
 
 
-def get_outages(
-    session: requests.Session,
+async def guess_directory(
+    client: httpx.AsyncClient,
+    timestamp: datetime,
+    max_offset: timedelta = timedelta(minutes=15),
+) -> Optional[str]:
+    """Guess directory for a given timestamp.
+
+    The Dominion outage map uses a "directory" to represent the timestamp at which a batch of files
+    was made available via their undocumented API. Directory timestamps appear to increment in 30s
+    intervals and usually occur within a few minutes of the 15 minute mark. The API includes an
+    endpoint to look up the most recent directory, but to check directories for older time points,
+    we have to guess: start guessing at the timestamp of interest, then increment by 30s intervals
+    until we either find a valid directory or reach the maximum offset.
+    """
+    for quadkey in QUADKEYS:
+        offset = timedelta()
+        while offset < max_offset:
+            directory = (timestamp + offset).strftime("%Y_%m_%d_%H_%M_%S")
+            path = OUTAGE_URL_TEMPLATE.format(directory=directory, quadkey=quadkey)
+            url = f"{BASE_URL}{path}"
+            logger.debug(url)
+            response = await client.get(url)
+            if response.status_code == 200:
+                logger.info(f"guessed directory {directory} from quadkey {quadkey}")
+                return directory
+            offset += timedelta(seconds=30)
+    return None
+
+
+async def get_outages(
+    client: httpx.AsyncClient,
     directory: str,
     quadkey: str,
     directory_timestamp: datetime,
     scrape_timestamp: datetime,
-) -> List[Dict]:
+):
+    """Recursively search a quadkey at a directory timestamp for outages."""
     path = OUTAGE_URL_TEMPLATE.format(directory=directory, quadkey=quadkey)
     url = f"{BASE_URL}{path}"
     logger.info(url)
-    response = session.get(url)
+    response = await client.get(url)
     # Files for quadkeys with no outages don't exist and return a 403; ignore these errors but
     # crash on any others.
     if response.status_code == 403:
-        return []
+        return
     response.raise_for_status()
     data = response.json()
     for row in data["file_data"]:
@@ -117,15 +151,21 @@ def get_outages(
             # Save the raw data in case we need to parse it again later.
             "raw": json.dumps(row),
         }
+
+    # Search children of quadkey to get more fine-grained details about outages. Note that we could
+    # potentially search more efficiently by intersecting potential child quadkeys with the
+    # geometries of the outages, but this is more complicated and possibly more error-prone. Prefer
+    # simpler brute-force approach.
     if len(quadkey) < MAX_QUADKEY_LENGTH:
         for quadrant in range(4):
-            yield from get_outages(
-                session,
+            async for outage in get_outages(
+                client,
                 directory,
                 f"{quadkey}{quadrant}",
                 directory_timestamp=directory_timestamp,
                 scrape_timestamp=scrape_timestamp,
-            )
+            ):
+                yield outage
 
 
 def marshal_timestamp(timestamp: datetime) -> str:
@@ -173,11 +213,81 @@ def polyline_to_shape(polyline: str) -> Optional[sg.base.BaseGeometry]:
     if len(decoded) == 1:
         return sg.Point(decoded[0]["lng"], decoded[0]["lat"])
     else:
-        return sg.LineString([[coord["lng"], coord["lat"]] for coord in decoded]).convex_hull
+        return sg.Polygon([[coord["lng"], coord["lat"]] for coord in decoded])
+
+
+def date_range(start, stop, interval):
+    while start < stop:
+        yield start
+        start += interval
+
+
+async def scrape_timestamp(client: httpx.AsyncClient, timestamp: datetime) -> None:
+    scrape_timestamp = datetime.now(timezone.utc)
+    path = pathlib.Path("./outages").joinpath(
+        f"{timestamp.strftime('%Y_%m_%d_%H_%M')}.json"
+    )
+    if path.exists():
+        logger.info(f"path {path} exists; skipping timestamp")
+        return
+    directory = await guess_directory(client, timestamp)
+    path.touch()
+    if directory is None:
+        logger.warning(
+            f"couldn't guess directory for timestamp {timestamp.isoformat()}"
+        )
+        return
+    directory_timestamp = datetime.strptime(directory, "%Y_%m_%d_%H_%M_%S").replace(
+        tzinfo=timezone.utc
+    )
+    timestamp_outages = []
+    for quadkey in QUADKEYS:
+        async for outage in get_outages(
+            client,
+            directory,
+            quadkey,
+            directory_timestamp=directory_timestamp,
+            scrape_timestamp=scrape_timestamp,
+        ):
+            timestamp_outages.extend(outage)
+        # timestamp_outages.extend(quadkey_outages)
+
+    with path.open("w") as fp:
+        for outage in timestamp_outages:
+            fp.write(json.dumps(outage))
+            fp.write("\n")
+
+
+async def gather_with_semaphore(n, *tasks, **kwargs):
+    semaphore = asyncio.Semaphore(n)
+
+    async def task_with_semaphore(task):
+        async with semaphore:
+            return await task
+
+    return await asyncio.gather(
+        *(task_with_semaphore(task) for task in tasks), **kwargs
+    )
+
+
+async def scrape_interval(
+    client: httpx.AsyncClient, timestamps: List[datetime], max_concurrency=1
+):
+    scrape_timestamp = datetime.now(timezone.utc)
+    tasks = [
+        scrape_timestamp(client, timestamp, scrape_timestamp)
+        for timestamp in timestamps
+    ]
+    results = await gather_with_semaphore(
+        max_concurrency, tasks, return_exceptions=True
+    )
+    errors = [result for result in results if isinstance(result, Exception)]
+    if len(errors) > 0:
+        raise RuntimeError(errors)
 
 
 def main():
-    session = requests.Session()
+    client = httpx.Client(verify=False)
     bq_client = bigquery.Client()
     scrape_timestamp = datetime.now(timezone.utc)
 
@@ -187,7 +297,7 @@ def main():
         field="directory_timestamp",
     )
 
-    directory = get_directory(session)
+    directory = get_current_directory(client)
     directory_timestamp = datetime.strptime(directory, "%Y_%m_%d_%H_%M_%S").replace(
         tzinfo=timezone.utc
     )
@@ -196,7 +306,7 @@ def main():
     for quadkey in QUADKEYS:
         outages.extend(
             get_outages(
-                session,
+                client,
                 directory,
                 quadkey,
                 directory_timestamp=directory_timestamp,
