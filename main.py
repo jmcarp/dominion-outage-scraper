@@ -222,16 +222,32 @@ def date_range(start, stop, interval):
         start += interval
 
 
-async def scrape_timestamp(client: httpx.AsyncClient, timestamp: datetime) -> None:
-    scrape_timestamp = datetime.now(timezone.utc)
-    path = pathlib.Path("./outages").joinpath(
-        f"{timestamp.strftime('%Y_%m_%d_%H_%M')}.json"
+def path_for_timestamp(timestamp: datetime, suffix=".json") -> pathlib.Path:
+    return pathlib.Path("./outages").joinpath(
+        f"{timestamp.strftime('%Y_%m_%d_%H_%M')}{suffix}"
     )
+
+
+async def scrape_timestamp(
+    client: httpx.AsyncClient,
+    timestamp: datetime,
+    scrape_timestamp: datetime,
+    retry_failed=False,
+) -> None:
+    path, tmp_path = path_for_timestamp(timestamp), path_for_timestamp(
+        timestamp, ".json.tmp"
+    )
+    # For some timestamps we aren't able to guess a directory, and guessing is expensive when this
+    # happens because we check every possible directory. To avoid repeat guessing, touch the output
+    # path when we start scraping, and skip scrapes if the path already exists. We can override this
+    # behavior by passing `retry_failed=True`.
     if path.exists():
-        logger.info(f"path {path} exists; skipping timestamp")
-        return
+        should_retry = retry_failed and tmp_path.stat().st_size == 0
+        if not (retry_failed and path.stat().st_size == 0):
+            logger.info(f"path {path} exists; skipping timestamp")
+            return
     directory = await guess_directory(client, timestamp)
-    path.touch()
+    tmp_path.touch()
     if directory is None:
         logger.warning(
             f"couldn't guess directory for timestamp {timestamp.isoformat()}"
@@ -249,16 +265,20 @@ async def scrape_timestamp(client: httpx.AsyncClient, timestamp: datetime) -> No
             directory_timestamp=directory_timestamp,
             scrape_timestamp=scrape_timestamp,
         ):
-            timestamp_outages.extend(outage)
-        # timestamp_outages.extend(quadkey_outages)
+            timestamp_outages.append(outage)
 
-    with path.open("w") as fp:
+    # Atomically write outages to disk by writing to temp path and then replacing final path.
+    with tmp_path.open("w") as fp:
         for outage in timestamp_outages:
             fp.write(json.dumps(outage))
             fp.write("\n")
+    tmp_path.replace(path)
 
 
 async def gather_with_semaphore(n, *tasks, **kwargs):
+    """Gather tasks using a semaphore to limit concurrency.
+
+    Taken from https://stackoverflow.com/a/61478547."""
     semaphore = asyncio.Semaphore(n)
 
     async def task_with_semaphore(task):
@@ -271,19 +291,51 @@ async def gather_with_semaphore(n, *tasks, **kwargs):
 
 
 async def scrape_interval(
-    client: httpx.AsyncClient, timestamps: List[datetime], max_concurrency=1
+    client: httpx.AsyncClient,
+    timestamps: List[datetime],
+    max_concurrency=1,
+    retry_failed=False,
 ):
-    scrape_timestamp = datetime.now(timezone.utc)
+    scraped_at = datetime.now(timezone.utc)
     tasks = [
-        scrape_timestamp(client, timestamp, scrape_timestamp)
+        scrape_timestamp(client, timestamp, scraped_at, retry_failed=retry_failed)
         for timestamp in timestamps
     ]
     results = await gather_with_semaphore(
-        max_concurrency, tasks, return_exceptions=True
+        max_concurrency, *tasks, return_exceptions=True
     )
     errors = [result for result in results if isinstance(result, Exception)]
     if len(errors) > 0:
         raise RuntimeError(errors)
+
+
+def load_outages(bq_client: bigquery.Client, timestamps: List[datetime]) -> None:
+    table = bigquery.Table(f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}", schema=SCHEMA)
+    table.time_partitioning = bigquery.TimePartitioning(
+        type_=bigquery.TimePartitioningType.DAY,
+        field="directory_timestamp",
+    )
+
+    def outages():
+        for timestamp in timestamps:
+            path = path_for_timestamp(timestamp)
+            with path.open() as fp:
+                for line in fp.readlines():
+                    yield json.loads(line)
+
+    bq_client.load_table_from_json(
+        outages(),
+        table,
+        # Try to accommodate changes in data shape
+        job_config=bigquery.LoadJobConfig(
+            create_disposition="CREATE_IF_NEEDED",
+            write_disposition="WRITE_APPEND",
+            schema_update_options=["ALLOW_FIELD_ADDITION"],
+            ignore_unknown_values=True,
+            allow_jagged_rows=True,
+            schema=table.schema,
+        ),
+    ).result()
 
 
 def main():
