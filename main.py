@@ -1,12 +1,26 @@
 #!/usr/bin/env python
 
+"""Scrape outage data from the Dominion Virginia map.
+
+The Dominion outage map uses outage data stored as json and organized in time by directory
+timestamps and in space by quadkeys. Directory timestamps are spaced roughly every 15 minutes, with
+some jitter possibly related to processing or upload time. Quadkeys are a geospatial indexing
+system that recursively divide space into quadrants, with each additional digit subdividing the
+previous tile into four:
+
+https://learn.microsoft.com/en-us/bingmaps/articles/bing-maps-tile-system
+
+Fortunately, Dominion has multiple years of outage data available through this system, although
+the format appears to be undocumented.
+"""
+
 import asyncio
 import json
 import logging
 import math
 import pathlib
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional
+from typing import AsyncIterable, Dict, List, Optional
 
 import googlemaps
 import httpx
@@ -85,6 +99,7 @@ logger = logging.getLogger(__name__)
 
 
 async def get_current_directory(client: httpx.AsyncClient) -> str:
+    """Get the currect "directory" timestamp."""
     response = await client.get(f"{BASE_URL}{METADATA_URL}")
     response.raise_for_status()
     return response.json()["directory"]
@@ -125,8 +140,13 @@ async def get_outages(
     quadkey: str,
     directory_timestamp: datetime,
     scrape_timestamp: datetime,
-):
-    """Recursively search a quadkey at a directory timestamp for outages."""
+) -> AsyncIterable[dict]:
+    """Recursively search a quadkey at a directory timestamp for outages.
+
+    Look up outages for the specified quadkey. Then, check each of its child quadkeys (0, 1, 2, 3)
+    for more detailed outage information, recursing until we reach an empty key or the maximum
+    quadkey length.
+    """
     path = OUTAGE_URL_TEMPLATE.format(directory=directory, quadkey=quadkey)
     url = f"{BASE_URL}{path}"
     logger.info(url)
@@ -169,7 +189,8 @@ async def get_outages(
 
 
 def marshal_timestamp(timestamp: datetime) -> str:
-    # We expect timestamps to be in utc already
+    """Marshal a timestamp as an iso-formatted string so that we can serialize to json."""
+    # We expect timestamps to be in utc already.
     assert (
         timestamp.tzinfo == timezone.utc
     ), f"got unexpected timezone {timestamp.tzinfo}"
@@ -222,18 +243,13 @@ def date_range(start, stop, interval):
         start += interval
 
 
-def path_for_timestamp(timestamp: datetime, suffix=".json") -> pathlib.Path:
-    return pathlib.Path("./outages").joinpath(
-        f"{timestamp.strftime('%Y_%m_%d_%H_%M')}{suffix}"
-    )
-
-
 async def scrape_timestamp(
     client: httpx.AsyncClient,
     timestamp: datetime,
     scrape_timestamp: datetime,
     retry_failed=False,
 ) -> None:
+    """Scrape outages for a given timestamp and write them to disk."""
     path, tmp_path = path_for_timestamp(timestamp), path_for_timestamp(
         timestamp, ".json.tmp"
     )
@@ -242,7 +258,7 @@ async def scrape_timestamp(
     # path when we start scraping, and skip scrapes if the path already exists. We can override this
     # behavior by passing `retry_failed=True`.
     if path.exists():
-        should_retry = retry_failed and tmp_path.stat().st_size == 0
+        should_retry = retry_failed and path.stat().st_size == 0
         if not (retry_failed and path.stat().st_size == 0):
             logger.info(f"path {path} exists; skipping timestamp")
             return
@@ -275,21 +291,6 @@ async def scrape_timestamp(
     tmp_path.replace(path)
 
 
-async def gather_with_semaphore(n, *tasks, **kwargs):
-    """Gather tasks using a semaphore to limit concurrency.
-
-    Taken from https://stackoverflow.com/a/61478547."""
-    semaphore = asyncio.Semaphore(n)
-
-    async def task_with_semaphore(task):
-        async with semaphore:
-            return await task
-
-    return await asyncio.gather(
-        *(task_with_semaphore(task) for task in tasks), **kwargs
-    )
-
-
 async def scrape_interval(
     client: httpx.AsyncClient,
     timestamps: List[datetime],
@@ -307,6 +308,27 @@ async def scrape_interval(
     errors = [result for result in results if isinstance(result, Exception)]
     if len(errors) > 0:
         raise RuntimeError(errors)
+
+
+def path_for_timestamp(timestamp: datetime, suffix=".json") -> pathlib.Path:
+    return pathlib.Path("./outages").joinpath(
+        f"{timestamp.strftime('%Y_%m_%d_%H_%M')}{suffix}"
+    )
+
+
+async def gather_with_semaphore(n, *tasks, **kwargs):
+    """Gather tasks using a semaphore to limit concurrency.
+
+    Taken from https://stackoverflow.com/a/61478547."""
+    semaphore = asyncio.Semaphore(n)
+
+    async def task_with_semaphore(task):
+        async with semaphore:
+            return await task
+
+    return await asyncio.gather(
+        *(task_with_semaphore(task) for task in tasks), **kwargs
+    )
 
 
 def load_outages(bq_client: bigquery.Client, timestamps: List[datetime]) -> None:
