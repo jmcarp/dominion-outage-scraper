@@ -14,11 +14,13 @@ Fortunately, Dominion has multiple years of outage data available through this s
 the format appears to be undocumented.
 """
 
+import argparse
 import asyncio
 import json
 import logging
 import math
 import pathlib
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import AsyncIterable, Dict, List, Optional
 
@@ -27,13 +29,51 @@ import httpx
 import shapely.geometry as sg
 from google.cloud import bigquery
 
-BASE_URL = "https://outagemap.dominionenergy.com/resources/data/external/interval_generation_data/"
-METADATA_URL = "metadata.json"
-OUTAGE_URL_TEMPLATE = "{directory}/outages/{quadkey}.json"
+
+@dataclass
+class Config:
+    base_url: str
+    base_path: pathlib.Path
+    label: str
+
+    metadata_url: str = "metadata.json"
+    outage_url_template: str = "{directory}/outages/{quadkey}.json"
+
+    def get_metadata_url(self) -> str:
+        return f"{self.base_url}{self.metadata_url}"
+
+    def get_outage_url(self, directory: str, quadkey: str) -> str:
+        path = self.outage_url_template.format(directory=directory, quadkey=quadkey)
+        return f"{self.base_url}{path}"
+
+    def path_for_timestamp(self, timestamp: datetime, suffix=".json") -> pathlib.Path:
+        return self.base_path.joinpath(
+            f"{timestamp.strftime('%Y_%m_%d_%H_%M')}{suffix}"
+        )
+
+
+DominionConfig = Config(
+    base_url="https://outagemap.dominionenergy.com/resources/data/external/interval_generation_data/",
+    base_path=pathlib.Path("./outages/dominion"),
+    label="dominion",
+)
+
+AppalachianConfig = Config(
+    base_url="https://d2oclp3li76tyy.cloudfront.net/resources/data/external/interval_generation_data/",
+    base_path=pathlib.Path("./outages/appalachian"),
+    label="appalachian",
+)
+
+CONFIGS = {
+    "dominion": DominionConfig,
+    "appalachian": AppalachianConfig,
+}
+
 
 PROJECT_ID = "cvilledata"
 DATASET_ID = "dominion"
 TABLE_ID = "outages"
+BUCKET_NAME = "dominion-outage-data"
 
 # Max quadkey length based on inspecting requests from the outage map.
 MAX_QUADKEY_LENGTH = 14
@@ -98,15 +138,16 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-async def get_current_directory(client: httpx.AsyncClient) -> str:
+async def get_current_directory(client: httpx.AsyncClient, config: Config) -> str:
     """Get the currect "directory" timestamp."""
-    response = await client.get(f"{BASE_URL}{METADATA_URL}")
+    response = await client.get(config.get_metadata_url())
     response.raise_for_status()
     return response.json()["directory"]
 
 
 async def guess_directory(
     client: httpx.AsyncClient,
+    config: Config,
     timestamp: datetime,
     max_offset: timedelta = timedelta(minutes=15),
 ) -> Optional[str]:
@@ -123,8 +164,7 @@ async def guess_directory(
         offset = timedelta()
         while offset < max_offset:
             directory = (timestamp + offset).strftime("%Y_%m_%d_%H_%M_%S")
-            path = OUTAGE_URL_TEMPLATE.format(directory=directory, quadkey=quadkey)
-            url = f"{BASE_URL}{path}"
+            url = config.get_outage_url(directory, quadkey)
             logger.debug(url)
             response = await client.get(url)
             if response.status_code == 200:
@@ -136,6 +176,7 @@ async def guess_directory(
 
 async def get_outages(
     client: httpx.AsyncClient,
+    config: Config,
     directory: str,
     quadkey: str,
     directory_timestamp: datetime,
@@ -147,8 +188,7 @@ async def get_outages(
     for more detailed outage information, recursing until we reach an empty key or the maximum
     quadkey length.
     """
-    path = OUTAGE_URL_TEMPLATE.format(directory=directory, quadkey=quadkey)
-    url = f"{BASE_URL}{path}"
+    url = config.get_outage_url(directory, quadkey)
     logger.info(url)
     response = await client.get(url)
     # Files for quadkeys with no outages don't exist and return a 403; ignore these errors but
@@ -180,6 +220,7 @@ async def get_outages(
         for quadrant in range(4):
             async for outage in get_outages(
                 client,
+                config,
                 directory,
                 f"{quadkey}{quadrant}",
                 directory_timestamp=directory_timestamp,
@@ -208,16 +249,16 @@ def polylines_to_shape(polylines: List[str]) -> Optional[str]:
         return None
     shapes = [polyline_to_shape(polyline) for polyline in polylines]
     # Ignore errors in polyline parsing
-    shapes = [shape for shape in shapes if shape is not None]
+    valid_shapes = [shape for shape in shapes if shape is not None]
     if len(shapes) == 1:
         return str(shapes[0])
     else:
-        if all(shape.type == "Point" for shape in shapes):
+        if all(shape.type == "Point" for shape in valid_shapes):
             return str(sg.MultiPoint(shapes))
-        elif all(shape.type == "Polygon" for shape in shapes):
+        elif all(shape.type == "Polygon" for shape in valid_shapes):
             return str(sg.MultiPolygon(shapes))
         else:
-            shape_types = [shape.type for shape in shapes]
+            shape_types = [shape.type for shape in valid_shapes]
             logger.warning(f"got mismatched types: {', '.join(shape_types)}")
             return None
 
@@ -245,14 +286,15 @@ def date_range(start, stop, interval):
 
 async def scrape_timestamp(
     client: httpx.AsyncClient,
+    config: Config,
     timestamp: datetime,
     scrape_timestamp: datetime,
     retry_failed=False,
 ) -> None:
     """Scrape outages for a given timestamp and write them to disk."""
-    path, tmp_path = path_for_timestamp(timestamp), path_for_timestamp(
-        timestamp, ".json.tmp"
-    )
+    path = config.path_for_timestamp(timestamp)
+    tmp_path = config.path_for_timestamp(timestamp, ".json.tmp")
+
     # For some timestamps we aren't able to guess a directory, and guessing is expensive when this
     # happens because we check every possible directory. To avoid repeat guessing, touch the output
     # path when we start scraping, and skip scrapes if the path already exists. We can override this
@@ -262,7 +304,7 @@ async def scrape_timestamp(
         if not (retry_failed and path.stat().st_size == 0):
             logger.info(f"path {path} exists; skipping timestamp")
             return
-    directory = await guess_directory(client, timestamp)
+    directory = await guess_directory(client, config, timestamp)
     tmp_path.touch()
     if directory is None:
         logger.warning(
@@ -276,6 +318,7 @@ async def scrape_timestamp(
     for quadkey in QUADKEYS:
         async for outage in get_outages(
             client,
+            config,
             directory,
             quadkey,
             directory_timestamp=directory_timestamp,
@@ -293,13 +336,16 @@ async def scrape_timestamp(
 
 async def scrape_interval(
     client: httpx.AsyncClient,
+    config: Config,
     timestamps: List[datetime],
     max_concurrency=1,
     retry_failed=False,
 ):
     scraped_at = datetime.now(timezone.utc)
     tasks = [
-        scrape_timestamp(client, timestamp, scraped_at, retry_failed=retry_failed)
+        scrape_timestamp(
+            client, config, timestamp, scraped_at, retry_failed=retry_failed
+        )
         for timestamp in timestamps
     ]
     results = await gather_with_semaphore(
@@ -308,12 +354,6 @@ async def scrape_interval(
     errors = [result for result in results if isinstance(result, Exception)]
     if len(errors) > 0:
         raise RuntimeError(errors)
-
-
-def path_for_timestamp(timestamp: datetime, suffix=".json") -> pathlib.Path:
-    return pathlib.Path("./outages").joinpath(
-        f"{timestamp.strftime('%Y_%m_%d_%H_%M')}{suffix}"
-    )
 
 
 async def gather_with_semaphore(n, *tasks, **kwargs):
@@ -331,28 +371,23 @@ async def gather_with_semaphore(n, *tasks, **kwargs):
     )
 
 
-def load_outages(bq_client: bigquery.Client, timestamps: List[datetime]) -> None:
-    table = bigquery.Table(f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}", schema=SCHEMA)
+def load_outages(bq_client: bigquery.Client, config: Config) -> None:
+    table = bigquery.Table(
+        f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}_{config.label}", schema=SCHEMA
+    )
     table.time_partitioning = bigquery.TimePartitioning(
         type_=bigquery.TimePartitioningType.DAY,
         field="directory_timestamp",
     )
 
-    def outages():
-        for timestamp in timestamps:
-            path = path_for_timestamp(timestamp)
-            with path.open() as fp:
-                for line in fp.readlines():
-                    yield json.loads(line)
-
-    bq_client.load_table_from_json(
-        outages(),
+    bq_client.load_table_from_uri(
+        [f"gs://{BUCKET_NAME}/scrape/{config.label}/*.json"],
         table,
         # Try to accommodate changes in data shape
         job_config=bigquery.LoadJobConfig(
             create_disposition="CREATE_IF_NEEDED",
-            write_disposition="WRITE_APPEND",
-            schema_update_options=["ALLOW_FIELD_ADDITION"],
+            write_disposition="WRITE_TRUNCATE",
+            source_format="NEWLINE_DELIMITED_JSON",
             ignore_unknown_values=True,
             allow_jagged_rows=True,
             schema=table.schema,
@@ -360,57 +395,48 @@ def load_outages(bq_client: bigquery.Client, timestamps: List[datetime]) -> None
     ).result()
 
 
-def main():
-    client = httpx.Client(verify=False)
+async def main():
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(required=True)
+
+    fetch_parser = subparsers.add_parser("fetch")
+    fetch_parser.add_argument("config", choices=CONFIGS.keys())
+    fetch_parser.add_argument("start_date", type=datetime.fromisoformat)
+    fetch_parser.add_argument("end_date", type=datetime.fromisoformat)
+    fetch_parser.add_argument(
+        "--interval-minutes",
+        type=lambda value: timedelta(minutes=int(value)),
+        default=timedelta(minutes=15),
+    )
+    fetch_parser.add_argument("--max-concurrency", type=int, default=20)
+    fetch_parser.add_argument("--retry-failed", action="store_true")
+    fetch_parser.set_defaults(func=fetch)
+
+    load_parser = subparsers.add_parser("load")
+    load_parser.add_argument("config", choices=CONFIGS.keys())
+    load_parser.set_defaults(func=load)
+
+    args = parser.parse_args()
+    await args.func(args)
+
+
+async def fetch(args):
+    config = CONFIGS[args.config]
+    client = httpx.AsyncClient(verify=False, timeout=30)
+    await scrape_interval(
+        client,
+        config,
+        date_range(args.start_date, args.end_date, args.interval_minutes),
+        max_concurrency=args.max_concurrency,
+        retry_failed=args.retry_failed,
+    )
+
+
+async def load(args):
     bq_client = bigquery.Client()
-    scrape_timestamp = datetime.now(timezone.utc)
-
-    table = bigquery.Table(f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}", schema=SCHEMA)
-    table.time_partitioning = bigquery.TimePartitioning(
-        type_=bigquery.TimePartitioningType.DAY,
-        field="directory_timestamp",
-    )
-
-    directory = get_current_directory(client)
-    directory_timestamp = datetime.strptime(directory, "%Y_%m_%d_%H_%M_%S").replace(
-        tzinfo=timezone.utc
-    )
-
-    outages = []
-    for quadkey in QUADKEYS:
-        outages.extend(
-            get_outages(
-                client,
-                directory,
-                quadkey,
-                directory_timestamp=directory_timestamp,
-                scrape_timestamp=scrape_timestamp,
-            )
-        )
-
-    logger.info(f"collected {len(outages)} outages")
-
-    bq_client.load_table_from_json(
-        outages,
-        table,
-        # Try to accommodate changes in data shape
-        job_config=bigquery.LoadJobConfig(
-            create_disposition="CREATE_IF_NEEDED",
-            write_disposition="WRITE_APPEND",
-            schema_update_options=["ALLOW_FIELD_ADDITION"],
-            ignore_unknown_values=True,
-            allow_jagged_rows=True,
-            schema=table.schema,
-        ),
-    ).result()
-
-    logger.info("wrote outages to bigquery")
-
-
-def entrypoint(event, context):
-    """Google cloud functions entrypoint."""
-    main()
+    config = CONFIGS[args.config]
+    load_outages(bq_client, config)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
