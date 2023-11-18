@@ -2,16 +2,22 @@
 
 """Scrape outage data from the Dominion Virginia map.
 
-The Dominion outage map uses outage data stored as json and organized in time by directory
-timestamps and in space by quadkeys. Directory timestamps are spaced roughly every 15 minutes, with
-some jitter possibly related to processing or upload time. Quadkeys are a geospatial indexing
-system that recursively divide space into quadrants, with each additional digit subdividing the
-previous tile into four:
+The Dominion outage map uses outage data stored as json and organized in time
+by directory timestamps and in space by quadkeys. Directory timestamps are
+spaced roughly every 15 minutes, with some jitter possibly related to
+processing or upload time. Quadkeys are a geospatial indexing system that
+recursively divide space into quadrants, with each additional digit subdividing
+the previous tile into four:
 
 https://learn.microsoft.com/en-us/bingmaps/articles/bing-maps-tile-system
 
-Fortunately, Dominion has multiple years of outage data available through this system, although
-the format appears to be undocumented.
+Fortunately, Dominion has multiple years of outage data available through this
+system, although the format appears to be undocumented.
+
+We scrape these records to disk, using one json file per directory timestamp,
+so that records are human-readable and easy to retry by timestamp. Before
+uploading to cloud storage for archival, we convert to monthly parquet files
+for better compression and performance.
 """
 
 import argparse
@@ -24,9 +30,11 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import AsyncIterable, Dict, List, Optional
 
+import duckdb
 import googlemaps
 import httpx
 import shapely.geometry as sg
+from dateutil.relativedelta import relativedelta
 from google.cloud import bigquery
 
 
@@ -34,6 +42,7 @@ from google.cloud import bigquery
 class Config:
     base_url: str
     base_path: pathlib.Path
+    parquet_path: pathlib.Path
     label: str
 
     metadata_url: str = "metadata.json"
@@ -55,12 +64,14 @@ class Config:
 DominionConfig = Config(
     base_url="https://outagemap.dominionenergy.com/resources/data/external/interval_generation_data/",
     base_path=pathlib.Path("./outages/dominion"),
+    parquet_path=pathlib.Path("./parquet/dominion"),
     label="dominion",
 )
 
 AppalachianConfig = Config(
     base_url="https://d2oclp3li76tyy.cloudfront.net/resources/data/external/interval_generation_data/",
     base_path=pathlib.Path("./outages/appalachian"),
+    parquet_path=pathlib.Path("./parquet/appalachian"),
     label="appalachian",
 )
 
@@ -95,7 +106,33 @@ QUADKEYS = [
     "03212",
 ]
 
-SCHEMA = [
+# TODO: Generate parquet colums from bigquery schema, or vice versa.
+PARQUET_COLUMNS = {
+    "id": "VARCHAR",
+    "title": "VARCHAR",
+    "file_title": "VARCHAR",
+    "desc": """STRUCT(
+        crew_icon BOOL,
+        cause VARCHAR,
+        crew_status VARCHAR,
+        start_etr VARCHAR,
+        end_etr VARCHAR,
+        cust_a STRUCT(
+            val INT
+        ),
+        cluster BOOL,
+        inc_id VARCHAR,
+        n_out INT
+    )""",
+    "geom": "STRUCT(p VARCHAR[], a VARCHAR[])",
+    "directory_timestamp": "TIMESTAMP",
+    "scrape_timestamp": "TIMESTAMP",
+    "point_shape": "VARCHAR",
+    "area_shape": "VARCHAR",
+    "raw": "VARCHAR",
+}
+
+BIGQUERY_SCHEMA = [
     bigquery.SchemaField("id", "STRING"),
     bigquery.SchemaField("title", "STRING"),
     bigquery.SchemaField("file_title", "STRING"),
@@ -153,12 +190,14 @@ async def guess_directory(
 ) -> Optional[str]:
     """Guess directory for a given timestamp.
 
-    The Dominion outage map uses a "directory" to represent the timestamp at which a batch of files
-    was made available via their undocumented API. Directory timestamps appear to increment in 30s
-    intervals and usually occur within a few minutes of the 15 minute mark. The API includes an
-    endpoint to look up the most recent directory, but to check directories for older time points,
-    we have to guess: start guessing at the timestamp of interest, then increment by 30s intervals
-    until we either find a valid directory or reach the maximum offset.
+    The Dominion outage map uses a "directory" to represent the timestamp at
+    which a batch of files was made available via their undocumented API.
+    Directory timestamps appear to increment in 30s intervals and usually occur
+    within a few minutes of the 15 minute mark. The API includes an endpoint to
+    look up the most recent directory, but to check directories for older time
+    points, we have to guess: start guessing at the timestamp of interest, then
+    increment by 30s intervals until we either find a valid directory or reach
+    the maximum offset.
     """
     for quadkey in QUADKEYS:
         offset = timedelta()
@@ -184,15 +223,15 @@ async def get_outages(
 ) -> AsyncIterable[dict]:
     """Recursively search a quadkey at a directory timestamp for outages.
 
-    Look up outages for the specified quadkey. Then, check each of its child quadkeys (0, 1, 2, 3)
-    for more detailed outage information, recursing until we reach an empty key or the maximum
-    quadkey length.
+    Look up outages for the specified quadkey. Then, check each of its child
+    quadkeys (0, 1, 2, 3) for more detailed outage information, recursing until
+    we reach an empty key or the maximum quadkey length.
     """
     url = config.get_outage_url(directory, quadkey)
     logger.info(url)
     response = await client.get(url)
-    # Files for quadkeys with no outages don't exist and return a 403; ignore these errors but
-    # crash on any others.
+    # Files for quadkeys with no outages don't exist and return a 403; ignore
+    # these errors but crash on any others.
     if response.status_code == 403:
         return
     response.raise_for_status()
@@ -212,9 +251,10 @@ async def get_outages(
             "raw": json.dumps(row),
         }
 
-    # Search children of quadkey to get more fine-grained details about outages. Note that we could
-    # potentially search more efficiently by intersecting potential child quadkeys with the
-    # geometries of the outages, but this is more complicated and possibly more error-prone. Prefer
+    # Search children of quadkey to get more fine-grained details about
+    # outages. Note that we could potentially search more efficiently by
+    # intersecting potential child quadkeys with the geometries of the outages,
+    # but this is more complicated and possibly more error-prone. Prefer
     # simpler brute-force approach.
     if len(quadkey) < MAX_QUADKEY_LENGTH:
         for quadrant in range(4):
@@ -230,7 +270,8 @@ async def get_outages(
 
 
 def marshal_timestamp(timestamp: datetime) -> str:
-    """Marshal a timestamp as an iso-formatted string so that we can serialize to json."""
+    """Marshal a timestamp as an iso-formatted string so that we can serialize
+    to json."""
     # We expect timestamps to be in utc already.
     assert (
         timestamp.tzinfo == timezone.utc
@@ -241,9 +282,10 @@ def marshal_timestamp(timestamp: datetime) -> str:
 def polylines_to_shape(polylines: List[str]) -> Optional[str]:
     """Convert a list of encoded polylines to a stringified shape.
 
-    Note: Dominion seems to use a single point for geom["p"] and a single line for geom["a"], but
-    both structures are arrays, so we try to handle multi-point and multi-line geometries. We don't
-    want to break ingestion if we fail to parse polyline, so warn on errors and return None.
+    Note: Dominion seems to use a single point for geom["p"] and a single line
+    for geom["a"], but both structures are arrays, so we try to handle
+    multi-point and multi-line geometries. We don't want to break ingestion if
+    we fail to parse polyline, so warn on errors and return None.
     """
     if len(polylines) == 0:
         return None
@@ -295,10 +337,11 @@ async def scrape_timestamp(
     path = config.path_for_timestamp(timestamp)
     tmp_path = config.path_for_timestamp(timestamp, ".json.tmp")
 
-    # For some timestamps we aren't able to guess a directory, and guessing is expensive when this
-    # happens because we check every possible directory. To avoid repeat guessing, touch the output
-    # path when we start scraping, and skip scrapes if the path already exists. We can override this
-    # behavior by passing `retry_failed=True`.
+    # For some timestamps we aren't able to guess a directory, and guessing is
+    # expensive when this happens because we check every possible directory. To
+    # avoid repeat guessing, touch the output path when we start scraping, and
+    # skip scrapes if the path already exists. We can override this behavior by
+    # passing `retry_failed=True`.
     if path.exists():
         should_retry = retry_failed and path.stat().st_size == 0
         if not (retry_failed and path.stat().st_size == 0):
@@ -326,7 +369,8 @@ async def scrape_timestamp(
         ):
             timestamp_outages.append(outage)
 
-    # Atomically write outages to disk by writing to temp path and then replacing final path.
+    # Atomically write outages to disk by writing to temp path and then
+    # replacing final path.
     with tmp_path.open("w") as fp:
         for outage in timestamp_outages:
             fp.write(json.dumps(outage))
@@ -373,7 +417,7 @@ async def gather_with_semaphore(n, *tasks, **kwargs):
 
 def load_outages(bq_client: bigquery.Client, config: Config) -> None:
     table = bigquery.Table(
-        f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}_{config.label}", schema=SCHEMA
+        f"{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}_{config.label}", schema=BIGQUERY_SCHEMA
     )
     table.time_partitioning = bigquery.TimePartitioning(
         type_=bigquery.TimePartitioningType.DAY,
@@ -381,15 +425,12 @@ def load_outages(bq_client: bigquery.Client, config: Config) -> None:
     )
 
     bq_client.load_table_from_uri(
-        [f"gs://{BUCKET_NAME}/scrape/{config.label}/*.json"],
+        [f"gs://{BUCKET_NAME}/parquet/{config.label}/*.parquet"],
         table,
-        # Try to accommodate changes in data shape
         job_config=bigquery.LoadJobConfig(
             create_disposition="CREATE_IF_NEEDED",
             write_disposition="WRITE_TRUNCATE",
-            source_format="NEWLINE_DELIMITED_JSON",
-            ignore_unknown_values=True,
-            allow_jagged_rows=True,
+            source_format="PARQUET",
             schema=table.schema,
         ),
     ).result()
@@ -412,6 +453,12 @@ async def main():
     fetch_parser.add_argument("--retry-failed", action="store_true")
     fetch_parser.set_defaults(func=fetch)
 
+    compact_parser = subparsers.add_parser("compact")
+    compact_parser.add_argument("config", choices=CONFIGS.keys())
+    compact_parser.add_argument("start_date", type=datetime.fromisoformat)
+    compact_parser.add_argument("end_date", type=datetime.fromisoformat)
+    compact_parser.set_defaults(func=compact)
+
     load_parser = subparsers.add_parser("load")
     load_parser.add_argument("config", choices=CONFIGS.keys())
     load_parser.set_defaults(func=load)
@@ -430,6 +477,24 @@ async def fetch(args):
         max_concurrency=args.max_concurrency,
         retry_failed=args.retry_failed,
     )
+
+
+async def compact(args):
+    config = CONFIGS[args.config]
+    start_month = datetime(args.start_date.year, args.start_date.month, 1)
+    end_month = datetime(args.end_date.year, args.end_date.month, 1)
+    month = start_month
+    while month < end_month:
+        duckdb.read_json(
+            str(config.base_path.joinpath(f"{month.year}_{month.month:02d}_*")),
+            format="auto",
+            columns=PARQUET_COLUMNS,
+        ).write_parquet(
+            str(
+                config.parquet_path.joinpath(f"{month.year}_{month.month:02d}.parquet")
+            ),
+        ),
+        month += relativedelta(months=1)
 
 
 async def load(args):
